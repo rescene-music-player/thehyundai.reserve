@@ -103,6 +103,9 @@ def check_all_dates(context):
     for rsv_dt, data in captured.items():
         slots = []
         items = data if isinstance(data, list) else data.get("data", data.get("list", []))
+        if items and not isinstance(items[0], dict):
+            print(f"⚠️ [{rsv_dt}] 예상과 다른 데이터 구조: {data}")
+            items = []
         for item in items or []:
             remain = item.get("rsvPossQty", item.get("remainQty", item.get("possQty", -1)))
             if isinstance(remain, (int, float)) and remain > 0:
