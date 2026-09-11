@@ -33,8 +33,8 @@ def send_discord(available):
     for rsv_dt, slots in available.items():
         date_str = f"{rsv_dt[:4]}/{rsv_dt[4:6]}/{rsv_dt[6:]} ({get_weekday(rsv_dt)})"
         for s in slots:
-            time_str = s.get("rsvBsicTimeNm", s.get("timeName", s.get("time", "시간 확인 필요")))
-            remain   = s.get("rsvPossQty", s.get("remainQty", "?"))
+            time_str = s.get("strRsvTimeGbcd", s.get("rsvBsicTimeNm", s.get("timeName", s.get("time", "시간 확인 필요"))))
+            remain   = s.get("rsvPossSeatQty", s.get("rsvPossQty", s.get("remainQty", "?")))
             lines.append(f"• {date_str} {time_str} — 잔여 {remain}석")
 
     desc = "\n".join(lines) if lines else "예약 가능한 슬롯이 감지되었습니다."
@@ -68,21 +68,62 @@ def send_discord(available):
             print(f"❌ 알림 오류: {e}")
 
 
+def extract_slots(data):
+    """API 응답 구조가 무엇이든 안전하게 예약 가능 슬롯을 뽑아낸다.
+    실패해도 절대 예외를 던지지 않고 빈 리스트를 반환한다."""
+    try:
+        # 후보 리스트 위치들을 순서대로 탐색
+        candidates = []
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            for key in ("data", "list", "result", "items", "rsvPossTimeList", "rsvPossTimeInfo"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    candidates = v
+                    break
+                if isinstance(v, dict):
+                    for k2 in ("data", "list", "items", "rsvPossTimeInfo"):
+                        v2 = v.get(k2)
+                        if isinstance(v2, list):
+                            candidates = v2
+                            break
+                    if candidates:
+                        break
+
+        slots = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            remain = None
+            for key in ("rsvPossQty", "remainQty", "possQty", "rsvPossCnt", "possCnt", "rsvPossSeatQty", "rsvRmndSeatQty"):
+                v = item.get(key)
+                if isinstance(v, (int, float)):
+                    remain = v
+                    break
+            if remain is not None and remain > 0:
+                slots.append(item)
+        return slots
+    except Exception as e:
+        print(f"⚠️ 슬롯 파싱 실패(무시하고 계속): {e}")
+        return []
+
+
 def check_all_dates(context):
     """날짜별로 페이지를 열고, 브라우저가 실제로 호출하는
-    reservationPossTime 응답을 가로채서 결과를 모은다."""
+    reservationPossTime 응답을 그대로 가로채서 결과를 모은다."""
     results = {}
     page = context.new_page()
     captured = {}
 
     def on_response(response):
-        m = API_URL_PATTERN.search(response.url)
-        if m and response.status == 200:
-            rsv_dt = m.group(1)
-            try:
+        try:
+            m = API_URL_PATTERN.search(response.url)
+            if m and response.status == 200:
+                rsv_dt = m.group(1)
                 captured[rsv_dt] = response.json()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     page.on("response", on_response)
 
@@ -91,29 +132,26 @@ def check_all_dates(context):
         for rsv_dt in TARGET_DATES:
             day_num = str(int(rsv_dt[6:]))
             try:
-                page.get_by_text(day_num, exact=True).first.click(timeout=3000)
-                page.wait_for_timeout(1200)
+                # 달력의 날짜 버튼만 선택 (다른 곳의 동일 숫자 텍스트와 혼동 방지)
+                btn = page.locator(f"button:has-text('{day_num}')").first
+                if btn.count() == 0:
+                    btn = page.get_by_text(day_num, exact=True).first
+                with page.expect_response(lambda r: bool(API_URL_PATTERN.search(r.url)), timeout=5000):
+                    btn.click(timeout=3000)
             except Exception:
                 pass
+            page.wait_for_timeout(500)
     except Exception as e:
-        print(f"⚠️ 페이지 탐색 오류: {e}")
+        print(f"⚠️ 페이지 탐색 오류(무시하고 계속): {e}")
     finally:
-        page.close()
+        try:
+            page.close()
+        except Exception:
+            pass
 
-    for rsv_dt, data in captured.items():
-        slots = []
-        items = data if isinstance(data, list) else data.get("data", data.get("list", []))
-        if not isinstance(items, list):
-            print(f"⚠️ [{rsv_dt}] 예상과 다른 데이터 구조: {data}")
-            items = []
-        elif items and not isinstance(items[0], dict):
-            print(f"⚠️ [{rsv_dt}] 예상과 다른 데이터 구조: {data}")
-            items = []
-        for item in items:
-            remain = item.get("rsvPossQty", item.get("remainQty", item.get("possQty", -1)))
-            if isinstance(remain, (int, float)) and remain > 0:
-                slots.append(item)
-        results[rsv_dt] = slots
+    for rsv_dt in TARGET_DATES:
+        data = captured.get(rsv_dt)
+        results[rsv_dt] = extract_slots(data) if data is not None else []
 
     return results
 
@@ -144,7 +182,7 @@ def monitor_loop():
             try:
                 available_raw = check_all_dates(context)
             except Exception as e:
-                print(f"⚠️ 체크 오류: {e}")
+                print(f"⚠️ 체크 오류(무시하고 계속): {e}")
                 available_raw = {}
 
             available = {k: v for k, v in available_raw.items() if v}
