@@ -1,69 +1,26 @@
 import os
+import re
 import time
 import threading
 import requests
 from datetime import datetime, date
 from flask import Flask, request, jsonify, send_from_directory
+from playwright.sync_api import sync_playwright
 
 import webhooks
 
-# ── 환경변수 (관리자용 세션 정보만 유지, 웹훅은 사용자가 등록) ──
 WMONID          = os.environ["WMONID"]
 AUTO_LOGIN_KEY  = os.environ["AUTO_LOGIN_KEY"]
 REMEMBER_ID     = os.environ["REMEMBER_ID"]
 PORT            = int(os.environ.get("PORT", 8080))
 
-# ── 예약 대상 날짜 (9/15 ~ 9/23) ─────────────────────
 TARGET_DATES = [
     "20260915", "20260916", "20260917", "20260918",
     "20260919", "20260920", "20260921", "20260922", "20260923"
 ]
 
 PAGE_URL = "https://hi.thehyundai.com/o4o/reservation/form?storeCd=400&brndLowCd=A91060&rsvItemCd=0000000540"
-API_URL  = "https://hi.thehyundai.com/proxy/v1/rs/reservation/reservationPossTime"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
-    "Referer": PAGE_URL,
-    "Accept": "application/json, text/plain, */*",
-}
-
-
-def get_cookies():
-    return {
-        "WMONID":             WMONID,
-        "isLogin":            "true",
-        "autoLoginYn":        "Y",
-        "autoLoginKey":       AUTO_LOGIN_KEY,
-        "unified_rememberId": REMEMBER_ID,
-    }
-
-
-# ── 예약 가능 시간대 조회 ─────────────────────────────
-def check_date(session, rsv_dt):
-    params = {
-        "storeCd":            "400",
-        "brndLowCd":          "A91060",
-        "rsvItemCd":          "0000000540",
-        "rsvDt":              rsv_dt,
-        "thdyRsvBsicTimeGbcd":"0",
-    }
-    try:
-        r = session.get(API_URL, params=params, timeout=10)
-        if r.status_code != 200:
-            print(f"[{rsv_dt}] HTTP {r.status_code}")
-            return []
-        data = r.json()
-        slots = []
-        items = data if isinstance(data, list) else data.get("data", data.get("list", []))
-        for item in items:
-            remain = item.get("rsvPossQty", item.get("remainQty", item.get("possQty", -1)))
-            if isinstance(remain, (int, float)) and remain > 0:
-                slots.append(item)
-        return slots
-    except Exception as e:
-        print(f"[{rsv_dt}] 오류: {e}")
-        return []
+API_URL_PATTERN = re.compile(r"reservationPossTime\?.*rsvDt=(\d{8})")
 
 
 def get_weekday(rsv_dt):
@@ -71,7 +28,6 @@ def get_weekday(rsv_dt):
     return ["월", "화", "수", "목", "금", "토", "일"][d.weekday()]
 
 
-# ── 디스코드 알림 (등록된 모든 웹훅으로 전송) ─────────
 def send_discord(available):
     lines = []
     for rsv_dt, slots in available.items():
@@ -104,7 +60,6 @@ def send_discord(available):
             if r.status_code in (200, 204):
                 print(f"✅ 알림 전송 완료 → {url[:50]}...")
             elif r.status_code == 404:
-                # 삭제되었거나 유효하지 않은 웹훅은 목록에서 제거
                 print(f"❌ 잘못된 웹훅, 제거 → {url[:50]}...")
                 webhooks.remove(url)
             else:
@@ -113,78 +68,97 @@ def send_discord(available):
             print(f"❌ 알림 오류: {e}")
 
 
-# ── 모니터링 백그라운드 루프 ──────────────────────────
-def get_session_with_login():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.cookies.update(get_cookies())
-    try:
-        r = session.get(PAGE_URL, timeout=10)
-        print(f"세션 초기화: HTTP {r.status_code}")
-    except Exception as e:
-        print(f"세션 초기화 오류: {e}")
-    refresh_access_token(session)
-    return session
+def check_all_dates(context):
+    """날짜별로 페이지를 열고, 브라우저가 실제로 호출하는
+    reservationPossTime 응답을 가로채서 결과를 모은다."""
+    results = {}
+    page = context.new_page()
+    captured = {}
 
+    def on_response(response):
+        m = API_URL_PATTERN.search(response.url)
+        if m and response.status == 200:
+            rsv_dt = m.group(1)
+            try:
+                captured[rsv_dt] = response.json()
+            except Exception:
+                pass
 
-def refresh_access_token(session):
-    """페이지 재방문 시 서버가 내려주는 accessToken 쿠키를 읽어
-    Authorization 헤더에 반영한다 (토큰은 약 30분마다 만료됨)."""
+    page.on("response", on_response)
+
     try:
-        session.get(PAGE_URL, timeout=10)
-        token = session.cookies.get("accessToken")
-        if token:
-            session.headers["Authorization"] = f"Bearer {token}"
-            print("🔑 accessToken 갱신 완료")
-        else:
-            print("⚠️ accessToken 쿠키를 찾지 못함")
+        page.goto(PAGE_URL, wait_until="networkidle", timeout=30000)
+        for rsv_dt in TARGET_DATES:
+            day_num = str(int(rsv_dt[6:]))
+            try:
+                page.get_by_text(day_num, exact=True).first.click(timeout=3000)
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
     except Exception as e:
-        print(f"⚠️ 토큰 갱신 오류: {e}")
+        print(f"⚠️ 페이지 탐색 오류: {e}")
+    finally:
+        page.close()
+
+    for rsv_dt, data in captured.items():
+        slots = []
+        items = data if isinstance(data, list) else data.get("data", data.get("list", []))
+        for item in items or []:
+            remain = item.get("rsvPossQty", item.get("remainQty", item.get("possQty", -1)))
+            if isinstance(remain, (int, float)) and remain > 0:
+                slots.append(item)
+        results[rsv_dt] = slots
+
+    return results
 
 
 def monitor_loop():
-    print("🚀 현대백화점 예약 취소표 모니터 시작!")
+    print("🚀 현대백화점 예약 취소표 모니터 시작! (Playwright 브라우저 모드)")
     print(f"📅 모니터링 날짜: {TARGET_DATES[0]} ~ {TARGET_DATES[-1]}")
 
     last_found = {}
-    interval = 3
-    last_refresh = time.time()
-    REFRESH_EVERY = 20 * 60  # 20분마다 토큰 갱신 (만료 30분보다 여유있게)
 
-    session = get_session_with_login()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
+        )
+        context.add_cookies([
+            {"name": "WMONID", "value": WMONID, "domain": "hi.thehyundai.com", "path": "/"},
+            {"name": "isLogin", "value": "true", "domain": "hi.thehyundai.com", "path": "/"},
+            {"name": "autoLoginYn", "value": "Y", "domain": "hi.thehyundai.com", "path": "/"},
+            {"name": "autoLoginKey", "value": AUTO_LOGIN_KEY, "domain": "hi.thehyundai.com", "path": "/"},
+            {"name": "unified_rememberId", "value": REMEMBER_ID, "domain": "hi.thehyundai.com", "path": "/"},
+        ])
 
-    while True:
-        if time.time() - last_refresh > REFRESH_EVERY:
-            refresh_access_token(session)
-            last_refresh = time.time()
+        while True:
+            now = datetime.now().strftime("%H:%M:%S")
+            print(f"\n[{now}] 전체 날짜 체크 중...")
 
-        now = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{now}] 전체 날짜 체크 중...")
+            try:
+                available_raw = check_all_dates(context)
+            except Exception as e:
+                print(f"⚠️ 체크 오류: {e}")
+                available_raw = {}
 
-        available = {}
-        for rsv_dt in TARGET_DATES:
-            slots = check_date(session, rsv_dt)
-            if slots:
-                available[rsv_dt] = slots
-                print(f"  🎉 {rsv_dt}: {len(slots)}개 슬롯 발견!")
-            else:
-                print(f"  — {rsv_dt}: 없음")
-            time.sleep(interval)
+            available = {k: v for k, v in available_raw.items() if v}
+            for rsv_dt in TARGET_DATES:
+                cnt = len(available.get(rsv_dt, []))
+                print(f"  {'🎉' if cnt else '—'} {rsv_dt}: {cnt if cnt else '없음'}")
 
-        new_available = {k: v for k, v in available.items() if k not in last_found or last_found[k] != len(v)}
-        if new_available:
-            send_discord(new_available)
-            last_found.update({k: len(v) for k, v in new_available.items()})
+            new_available = {k: v for k, v in available.items() if k not in last_found or last_found[k] != len(v)}
+            if new_available:
+                send_discord(new_available)
+                last_found.update({k: len(v) for k, v in new_available.items()})
 
-        for k in list(last_found.keys()):
-            if k not in available:
-                del last_found[k]
+            for k in list(last_found.keys()):
+                if k not in available:
+                    del last_found[k]
 
-        print(f"[{now}] 30초 후 재확인...")
-        time.sleep(30)
+            print(f"[{now}] 30초 후 재확인...")
+            time.sleep(30)
 
 
-# ── Flask 웹서버 (웹훅 등록용) ─────────────────────────
 app = Flask(__name__, static_folder=None)
 
 
