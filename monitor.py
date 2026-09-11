@@ -1,13 +1,17 @@
 import os
 import time
+import threading
 import requests
 from datetime import datetime, date
+from flask import Flask, request, jsonify, send_from_directory
 
-# ── 환경변수 ──────────────────────────────────────────
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+import webhooks
+
+# ── 환경변수 (관리자용 세션 정보만 유지, 웹훅은 사용자가 등록) ──
 WMONID          = os.environ["WMONID"]
 AUTO_LOGIN_KEY  = os.environ["AUTO_LOGIN_KEY"]
 REMEMBER_ID     = os.environ["REMEMBER_ID"]
+PORT            = int(os.environ.get("PORT", 8080))
 
 # ── 예약 대상 날짜 (9/15 ~ 9/23) ─────────────────────
 TARGET_DATES = [
@@ -24,6 +28,7 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+
 def get_cookies():
     return {
         "WMONID":             WMONID,
@@ -33,16 +38,6 @@ def get_cookies():
         "unified_rememberId": REMEMBER_ID,
     }
 
-def get_cookie_header():
-    # 로그인 갱신을 위해 페이지 먼저 방문해서 세션 쿠키 획득
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.cookies.update(get_cookies())
-    try:
-        session.get(PAGE_URL, timeout=10)
-    except Exception:
-        pass
-    return session
 
 # ── 예약 가능 시간대 조회 ─────────────────────────────
 def check_date(session, rsv_dt):
@@ -59,7 +54,6 @@ def check_date(session, rsv_dt):
             print(f"[{rsv_dt}] HTTP {r.status_code}")
             return []
         data = r.json()
-        # 예약 가능(잔여 > 0) 시간대 필터
         slots = []
         items = data if isinstance(data, list) else data.get("data", data.get("list", []))
         for item in items:
@@ -71,7 +65,13 @@ def check_date(session, rsv_dt):
         print(f"[{rsv_dt}] 오류: {e}")
         return []
 
-# ── 디스코드 알림 ─────────────────────────────────────
+
+def get_weekday(rsv_dt):
+    d = date(int(rsv_dt[:4]), int(rsv_dt[4:6]), int(rsv_dt[6:]))
+    return ["월", "화", "수", "목", "금", "토", "일"][d.weekday()]
+
+
+# ── 디스코드 알림 (등록된 모든 웹훅으로 전송) ─────────
 def send_discord(available):
     lines = []
     for rsv_dt, slots in available.items():
@@ -92,59 +92,28 @@ def send_discord(available):
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }]
     }
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        if r.status_code in (200, 204):
-            print("✅ 디스코드 알림 전송 완료!")
-        else:
-            print(f"❌ 알림 실패: {r.status_code}")
-    except Exception as e:
-        print(f"❌ 알림 오류: {e}")
 
-def get_weekday(rsv_dt):
-    d = date(int(rsv_dt[:4]), int(rsv_dt[4:6]), int(rsv_dt[6:]))
-    return ["월","화","수","목","금","토","일"][d.weekday()]
+    hooks = webhooks.get_all()
+    if not hooks:
+        print("⚠️ 등록된 웹훅이 없습니다.")
+        return
 
-# ── 메인 루프 ─────────────────────────────────────────
-def main():
-    print("🚀 현대백화점 예약 취소표 모니터 시작!")
-    print(f"📅 모니터링 날짜: {TARGET_DATES[0]} ~ {TARGET_DATES[-1]}")
-    
-    last_found = {}  # 중복 알림 방지
-    interval   = 3   # 초 (날짜당 요청 간격)
-    
-    session = get_session_with_login()
-
-    while True:
-        now = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{now}] 전체 날짜 체크 중...")
-
-        available = {}
-        for rsv_dt in TARGET_DATES:
-            slots = check_date(session, rsv_dt)
-            if slots:
-                key = f"{rsv_dt}:{len(slots)}"
-                available[rsv_dt] = slots
-                print(f"  🎉 {rsv_dt}: {len(slots)}개 슬롯 발견!")
+    for url in hooks:
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code in (200, 204):
+                print(f"✅ 알림 전송 완료 → {url[:50]}...")
+            elif r.status_code == 404:
+                # 삭제되었거나 유효하지 않은 웹훅은 목록에서 제거
+                print(f"❌ 잘못된 웹훅, 제거 → {url[:50]}...")
+                webhooks.remove(url)
             else:
-                print(f"  — {rsv_dt}: 없음")
-            time.sleep(interval)
+                print(f"❌ 알림 실패({r.status_code}) → {url[:50]}...")
+        except Exception as e:
+            print(f"❌ 알림 오류: {e}")
 
-        # 새로 생긴 슬롯만 알림
-        new_available = {k: v for k, v in available.items() if k not in last_found or last_found[k] != len(v)}
-        if new_available:
-            send_discord(new_available)
-            last_found.update({k: len(v) for k, v in new_available.items()})
-        
-        # 사라진 날짜는 last_found에서 제거
-        for k in list(last_found.keys()):
-            if k not in available:
-                del last_found[k]
 
-        # 전체 날짜 체크 후 30초 대기
-        print(f"[{now}] 30초 후 재확인...")
-        time.sleep(30)
-
+# ── 모니터링 백그라운드 루프 ──────────────────────────
 def get_session_with_login():
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -156,5 +125,67 @@ def get_session_with_login():
         print(f"세션 초기화 오류: {e}")
     return session
 
+
+def monitor_loop():
+    print("🚀 현대백화점 예약 취소표 모니터 시작!")
+    print(f"📅 모니터링 날짜: {TARGET_DATES[0]} ~ {TARGET_DATES[-1]}")
+
+    last_found = {}
+    interval = 3
+
+    session = get_session_with_login()
+
+    while True:
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"\n[{now}] 전체 날짜 체크 중...")
+
+        available = {}
+        for rsv_dt in TARGET_DATES:
+            slots = check_date(session, rsv_dt)
+            if slots:
+                available[rsv_dt] = slots
+                print(f"  🎉 {rsv_dt}: {len(slots)}개 슬롯 발견!")
+            else:
+                print(f"  — {rsv_dt}: 없음")
+            time.sleep(interval)
+
+        new_available = {k: v for k, v in available.items() if k not in last_found or last_found[k] != len(v)}
+        if new_available:
+            send_discord(new_available)
+            last_found.update({k: len(v) for k, v in new_available.items()})
+
+        for k in list(last_found.keys()):
+            if k not in available:
+                del last_found[k]
+
+        print(f"[{now}] 30초 후 재확인...")
+        time.sleep(30)
+
+
+# ── Flask 웹서버 (웹훅 등록용) ─────────────────────────
+app = Flask(__name__, static_folder=None)
+
+
+@app.route("/")
+def index():
+    return send_from_directory(".", "index.html")
+
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json(silent=True) or {}
+    url = data.get("webhook", "")
+    if webhooks.add(url):
+        return jsonify({"ok": True})
+    return jsonify({"error": "올바른 디스코드 웹훅 URL이 아닙니다."}), 400
+
+
+@app.route("/api/status")
+def status():
+    return jsonify({"registered_count": len(webhooks.get_all())})
+
+
 if __name__ == "__main__":
-    main()
+    t = threading.Thread(target=monitor_loop, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=PORT)

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>현대백화점 예약 알림 등록</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; display:flex; justify-content:center; padding:40px 16px; }
+  .card { max-width:480px; width:100%; background:#1c1c1c; padding:28px; border-radius:12px; }
+  h1 { font-size:20px; margin-bottom:8px; }
+  p { color:#aaa; font-size:14px; line-height:1.5; }
+  input { width:100%; padding:12px; margin-top:16px; border-radius:8px; border:1px solid #333; background:#0d0d0d; color:#fff; box-sizing:border-box; }
+  button { width:100%; margin-top:14px; padding:12px; border:none; border-radius:8px; background:#5865F2; color:#fff; font-weight:600; cursor:pointer; }
+  button:hover { background:#4752c4; }
+  #msg { margin-top:12px; font-size:14px; }
+  code { background:#0d0d0d; padding:2px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔔 현대백화점 예약 취소표 알림</h1>
+  <p>본인의 디스코드 채널 웹훅 URL을 입력하면, 예약 가능한 취소표가 뜰 때 그 채널로 알림이 전송됩니다.<br>
+  웹훅 URL은 디스코드 채널 설정 → 연동 → 웹후크에서 만들 수 있어요.</p>
+  <input id="webhook" type="text" placeholder="https://discord.com/api/webhooks/...">
+  <button onclick="register()">알림 등록하기</button>
+  <div id="msg"></div>
+</div>
+<script>
+async function register() {
+  const url = document.getElementById('webhook').value.trim();
+  const msg = document.getElementById('msg');
+  msg.textContent = '';
+  if (!url) { msg.textContent = '웹훅 URL을 입력해주세요.'; msg.style.color = '#f66'; return; }
+  try {
+    const res = await fetch('/api/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhook: url })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = '✅ 등록 완료! 예약 가능 시 알림이 갑니다.';
+      msg.style.color = '#6f6';
+      document.getElementById('webhook').value = '';
+    } else {
+      msg.textContent = '❌ ' + (data.error || '등록 실패 (URL 형식 확인)');
+      msg.style.color = '#f66';
+    }
+  } catch (e) {
+    msg.textContent = '❌ 서버 오류';
+    msg.style.color = '#f66';
+  }
+}
+</script>
+</body>
+</html>
