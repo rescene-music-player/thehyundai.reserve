@@ -123,7 +123,23 @@ def get_session_with_login():
         print(f"세션 초기화: HTTP {r.status_code}")
     except Exception as e:
         print(f"세션 초기화 오류: {e}")
+    refresh_access_token(session)
     return session
+
+
+def refresh_access_token(session):
+    """페이지 재방문 시 서버가 내려주는 accessToken 쿠키를 읽어
+    Authorization 헤더에 반영한다 (토큰은 약 30분마다 만료됨)."""
+    try:
+        session.get(PAGE_URL, timeout=10)
+        token = session.cookies.get("accessToken")
+        if token:
+            session.headers["Authorization"] = f"Bearer {token}"
+            print("🔑 accessToken 갱신 완료")
+        else:
+            print("⚠️ accessToken 쿠키를 찾지 못함")
+    except Exception as e:
+        print(f"⚠️ 토큰 갱신 오류: {e}")
 
 
 def monitor_loop():
@@ -132,10 +148,16 @@ def monitor_loop():
 
     last_found = {}
     interval = 3
+    last_refresh = time.time()
+    REFRESH_EVERY = 20 * 60  # 20분마다 토큰 갱신 (만료 30분보다 여유있게)
 
     session = get_session_with_login()
 
     while True:
+        if time.time() - last_refresh > REFRESH_EVERY:
+            refresh_access_token(session)
+            last_refresh = time.time()
+
         now = datetime.now().strftime("%H:%M:%S")
         print(f"\n[{now}] 전체 날짜 체크 중...")
 
