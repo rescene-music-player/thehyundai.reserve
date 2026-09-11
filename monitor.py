@@ -109,21 +109,30 @@ def extract_slots(data):
         return []
 
 
-def check_all_dates(context):
-    """날짜별로 페이지를 열고, 브라우저가 실제로 호출하는
-    reservationPossTime 응답을 그대로 가로채서 결과를 모은다."""
-    results = {}
+def check_all_dates(context, last_found):
+    """날짜별로 페이지를 열고 클릭하면서, API 응답이 오는 즉시(다른 날짜 체크를
+    기다리지 않고) 슬롯 발견 시 바로 디스코드 알림을 보낸다."""
     page = context.new_page()
-    captured = {}
 
     def on_response(response):
         try:
             m = API_URL_PATTERN.search(response.url)
-            if m and response.status == 200:
-                rsv_dt = m.group(1)
-                captured[rsv_dt] = response.json()
-        except Exception:
-            pass
+            if not (m and response.status == 200):
+                return
+            rsv_dt = m.group(1)
+            data = response.json()
+            slots = extract_slots(data)
+            cnt = len(slots)
+            if cnt > 0 and last_found.get(rsv_dt) != cnt:
+                print(f"  🎉 {rsv_dt}: {cnt}개 슬롯 발견! 즉시 알림 전송")
+                send_discord({rsv_dt: slots})
+                last_found[rsv_dt] = cnt
+            elif cnt == 0 and rsv_dt in last_found:
+                del last_found[rsv_dt]
+            elif cnt == 0:
+                print(f"  — {rsv_dt}: 없음")
+        except Exception as e:
+            print(f"⚠️ 응답 처리 오류(무시하고 계속): {e}")
 
     page.on("response", on_response)
 
@@ -132,15 +141,13 @@ def check_all_dates(context):
         for rsv_dt in TARGET_DATES:
             day_num = str(int(rsv_dt[6:]))
             try:
-                # 달력의 날짜 버튼만 선택 (다른 곳의 동일 숫자 텍스트와 혼동 방지)
                 btn = page.locator(f"button:has-text('{day_num}')").first
                 if btn.count() == 0:
                     btn = page.get_by_text(day_num, exact=True).first
-                with page.expect_response(lambda r: bool(API_URL_PATTERN.search(r.url)), timeout=5000):
-                    btn.click(timeout=3000)
+                btn.click(timeout=2000)
             except Exception:
                 pass
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(300)  # 응답 처리 시간만 짧게 확보, 다음 날짜로 바로 진행
     except Exception as e:
         print(f"⚠️ 페이지 탐색 오류(무시하고 계속): {e}")
     finally:
@@ -148,12 +155,6 @@ def check_all_dates(context):
             page.close()
         except Exception:
             pass
-
-    for rsv_dt in TARGET_DATES:
-        data = captured.get(rsv_dt)
-        results[rsv_dt] = extract_slots(data) if data is not None else []
-
-    return results
 
 
 def monitor_loop():
@@ -180,24 +181,9 @@ def monitor_loop():
             print(f"\n[{now}] 전체 날짜 체크 중...")
 
             try:
-                available_raw = check_all_dates(context)
+                check_all_dates(context, last_found)
             except Exception as e:
                 print(f"⚠️ 체크 오류(무시하고 계속): {e}")
-                available_raw = {}
-
-            available = {k: v for k, v in available_raw.items() if v}
-            for rsv_dt in TARGET_DATES:
-                cnt = len(available.get(rsv_dt, []))
-                print(f"  {'🎉' if cnt else '—'} {rsv_dt}: {cnt if cnt else '없음'}")
-
-            new_available = {k: v for k, v in available.items() if k not in last_found or last_found[k] != len(v)}
-            if new_available:
-                send_discord(new_available)
-                last_found.update({k: len(v) for k, v in new_available.items()})
-
-            for k in list(last_found.keys()):
-                if k not in available:
-                    del last_found[k]
 
             print(f"[{now}] 5초 후 재확인...")
             time.sleep(5)
