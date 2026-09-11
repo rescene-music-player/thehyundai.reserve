@@ -199,8 +199,8 @@ def monitor_loop():
                 if k not in available:
                     del last_found[k]
 
-            print(f"[{now}] 30초 후 재확인...")
-            time.sleep(30)
+            print(f"[{now}] 5초 후 재확인...")
+            time.sleep(5)
 
 
 app = Flask(__name__, static_folder=None)
