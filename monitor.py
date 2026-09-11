@@ -109,50 +109,16 @@ def extract_slots(data):
         return []
 
 
-def check_all_dates(context, last_found):
-    """날짜별로 페이지를 열고 클릭하면서, API 응답이 오는 즉시(다른 날짜 체크를
-    기다리지 않고) 슬롯 발견 시 바로 디스코드 알림을 보낸다."""
-    page = context.new_page()
-
-    def on_response(response):
+def check_one_cycle(page, last_found):
+    """이미 열려있는 페이지에서 날짜들을 다시 클릭해 최신 데이터를 갱신시킨다.
+    API 응답이 오는 즉시(다른 날짜 체크를 기다리지 않고) 슬롯 발견 시 바로 알림을 보낸다."""
+    for rsv_dt in TARGET_DATES:
+        day_num = str(int(rsv_dt[6:]))
         try:
-            m = API_URL_PATTERN.search(response.url)
-            if not (m and response.status == 200):
-                return
-            rsv_dt = m.group(1)
-            data = response.json()
-            slots = extract_slots(data)
-            cnt = len(slots)
-            if cnt > 0 and last_found.get(rsv_dt) != cnt:
-                print(f"  🎉 {rsv_dt}: {cnt}개 슬롯 발견! 즉시 알림 전송")
-                send_discord({rsv_dt: slots})
-                last_found[rsv_dt] = cnt
-            elif cnt == 0 and rsv_dt in last_found:
-                del last_found[rsv_dt]
-            elif cnt == 0:
-                print(f"  — {rsv_dt}: 없음")
-        except Exception as e:
-            print(f"⚠️ 응답 처리 오류(무시하고 계속): {e}")
-
-    page.on("response", on_response)
-
-    try:
-        page.goto(PAGE_URL, wait_until="networkidle", timeout=30000)
-        for rsv_dt in TARGET_DATES:
-            day_num = str(int(rsv_dt[6:]))
-            try:
-                btn = page.locator(f"button:has-text('{day_num}')").first
-                if btn.count() == 0:
-                    btn = page.get_by_text(day_num, exact=True).first
-                btn.click(timeout=2000)
-            except Exception:
-                pass
-            page.wait_for_timeout(300)  # 응답 처리 시간만 짧게 확보, 다음 날짜로 바로 진행
-    except Exception as e:
-        print(f"⚠️ 페이지 탐색 오류(무시하고 계속): {e}")
-    finally:
-        try:
-            page.close()
+            btn = page.locator(f"button:has-text('{day_num}')").first
+            if btn.count() == 0:
+                btn = page.get_by_text(day_num, exact=True).first
+            btn.click(timeout=1500)
         except Exception:
             pass
 
@@ -176,17 +142,50 @@ def monitor_loop():
             {"name": "unified_rememberId", "value": REMEMBER_ID, "domain": "hi.thehyundai.com", "path": "/"},
         ])
 
+        page = context.new_page()
+
+        def on_response(response):
+            try:
+                m = API_URL_PATTERN.search(response.url)
+                if not (m and response.status == 200):
+                    return
+                rsv_dt = m.group(1)
+                data = response.json()
+                slots = extract_slots(data)
+                cnt = len(slots)
+                if cnt > 0 and last_found.get(rsv_dt) != cnt:
+                    print(f"  🎉 {rsv_dt}: {cnt}개 슬롯 발견! 즉시 알림 전송")
+                    send_discord({rsv_dt: slots})
+                    last_found[rsv_dt] = cnt
+                elif cnt == 0 and rsv_dt in last_found:
+                    del last_found[rsv_dt]
+            except Exception as e:
+                print(f"⚠️ 응답 처리 오류(무시하고 계속): {e}")
+
+        page.on("response", on_response)
+
+        # 페이지는 한 번만 로드하고, 이후엔 계속 재사용 (매 사이클 재로딩 없음 → 훨씬 빠름)
+        page.goto(PAGE_URL, wait_until="networkidle", timeout=30000)
+
+        last_reload = time.time()
+        RELOAD_EVERY = 15 * 60  # 세션 만료 방지용으로만 15분마다 새로고침
+
         while True:
             now = datetime.now().strftime("%H:%M:%S")
-            print(f"\n[{now}] 전체 날짜 체크 중...")
+
+            if time.time() - last_reload > RELOAD_EVERY:
+                try:
+                    page.reload(wait_until="networkidle", timeout=30000)
+                except Exception as e:
+                    print(f"⚠️ 새로고침 오류(무시하고 계속): {e}")
+                last_reload = time.time()
 
             try:
-                check_all_dates(context, last_found)
+                check_one_cycle(page, last_found)
             except Exception as e:
                 print(f"⚠️ 체크 오류(무시하고 계속): {e}")
 
-            print(f"[{now}] 5초 후 재확인...")
-            time.sleep(5)
+            time.sleep(0.2)
 
 
 app = Flask(__name__, static_folder=None)
