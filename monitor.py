@@ -211,6 +211,14 @@ def status():
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=monitor_loop, daemon=True)
+    def run_monitor():
+        try:
+            monitor_loop()
+        except Exception as e:
+            import traceback
+            print(f"🔥 모니터 스레드 죽음: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=run_monitor, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=PORT)
