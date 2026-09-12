@@ -34,7 +34,7 @@ def send_discord(available):
         date_str = f"{rsv_dt[:4]}/{rsv_dt[4:6]}/{rsv_dt[6:]} ({get_weekday(rsv_dt)})"
         for s in slots:
             time_str = s.get("strRsvTimeGbcd", s.get("rsvBsicTimeNm", s.get("timeName", s.get("time", "시간 확인 필요"))))
-            remain   = s.get("rsvPossSeatQty", s.get("rsvPossQty", s.get("remainQty", "?")))
+            remain   = s.get("rsvRmndSeatQty", s.get("rsvPossSeatQty", s.get("rsvPossQty", s.get("remainQty", "?"))))
             lines.append(f"• {date_str} {time_str} — 잔여 {remain}석")
 
     desc = "\n".join(lines) if lines else "예약 가능한 슬롯이 감지되었습니다."
@@ -96,7 +96,7 @@ def extract_slots(data):
             if not isinstance(item, dict):
                 continue
             remain = None
-            for key in ("rsvPossQty", "remainQty", "possQty", "rsvPossCnt", "possCnt", "rsvPossSeatQty", "rsvRmndSeatQty"):
+            for key in ("rsvRmndSeatQty", "remainQty", "rsvPossQty", "possQty", "rsvPossCnt", "possCnt", "rsvPossSeatQty"):
                 v = item.get(key)
                 if isinstance(v, (int, float)):
                     remain = v
@@ -115,12 +115,15 @@ def check_one_cycle(page, last_found):
     for rsv_dt in TARGET_DATES:
         day_num = str(int(rsv_dt[6:]))
         try:
-            btn = page.locator(f"button:has-text('{day_num}')").first
+            btn = page.locator("button").filter(has_text=re.compile(rf"^{day_num}$")).first
             if btn.count() == 0:
-                btn = page.get_by_text(day_num, exact=True).first
+                btn = page.get_by_text(re.compile(rf"^{day_num}$"), exact=True).first
+            if btn.count() == 0:
+                print(f"⚠️ {rsv_dt} 날짜 버튼을 찾지 못함")
+                continue
             btn.click(timeout=1500)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ {rsv_dt} 클릭 실패: {e}")
 
 
 def monitor_loop():
